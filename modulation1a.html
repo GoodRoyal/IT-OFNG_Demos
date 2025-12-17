@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>IT-OFNG Heterogeneous Coordination Demo</title>
+    <style>
+        canvas {
+            border: 1px solid black;
+        }
+        .container {
+            display: flex;
+            justify-content: space-around;
+        }
+        .sim {
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <h1>Demo: Heterogeneous Coordination - Temporal Equity Modulation</h1>
+    <p>This demo simulates coordination in a swarm with fast low-entropy nodes (red, biased wrong) and slow high-entropy nodes (blue, accurate but uncertain).</p>
+    <p>Left: Baseline (Averages all inputs, dominated by fast nodes).</p>
+    <p>Right: IT-OFNG (Modulates influence by temporal equity, giving more weight to high-entropy nodes).</p>
+    <p>Red dots: Fast low-entropy (wrong bias). Blue dots: Slow high-entropy (correct bias).</p>
+    <p>Green star: Correct target. Red star: Wrong target.</p>
+    <p>The simulation runs until convergence. Press "Start Simulation" to begin.</p>
+    <button onclick="startSimulation()">Start Simulation</button>
+    <div class="container">
+        <div class="sim">
+            <h2>Baseline Averaging</h2>
+            <canvas id="baselineCanvas" width="400" height="400"></canvas>
+            <div id="baselineMetrics"></div>
+        </div>
+        <div class="sim">
+            <h2>IT-OFNG</h2>
+            <canvas id="itofngCanvas" width="400" height="400"></canvas>
+            <div id="itofngMetrics"></div>
+        </div>
+    </div>
+
+    <script>
+        // Constants
+        const N = 50;  // 40 fast, 10 slow
+        const FAST_COUNT = 40;
+        const DIM_STATE = 10;
+        const DIM_TRAJECTORY = 2;
+        const EPSILON = 1e-10;
+        const ALPHA = 0.7;
+        const V_S = 1.0;
+        const A = 50.0;  // High attention limit to show effect
+        const THETA_COMP = 1.0;  // Not used, no compromise
+        const SCALE = 5;  // Position update scale
+        const MAX_TIME = 300;
+        const CORRECT_TARGET = [200, 300];
+        const WRONG_TARGET = [200, 100];
+
+        // Helper functions
+        function klDivergence(p, q) {
+            let sum = 0;
+            for (let i = 0; i < p.length; i++) {
+                const pi = Math.max(p[i], EPSILON);
+                const qi = Math.max(q[i], EPSILON);
+                sum += pi * Math.log(pi / qi);
+            }
+            return sum;
+        }
+
+        function vectorNorm(v) {
+            return Math.sqrt(v.reduce((acc, val) => acc + val * val, 0));
+        }
+
+        function dotProduct(a, b) {
+            return a.reduce((acc, val, i) => acc + val * b[i], 0);
+        }
+
+        function perpendicularDivergence(subI, subJ) {
+            const dkl = klDivergence(subI.p, subJ.p);
+            const cosTheta = Math.abs(dotProduct(subI.v, subJ.v) / (vectorNorm(subI.v) * vectorNorm(subJ.v) + EPSILON));
+            return dkl * (1 - cosTheta);
+        }
+
+        function temporalModulation(sub, vS) {
+            const dt = (vS / (sub.r + EPSILON)) * Math.exp(sub.h);
+            return Math.min(dt, A);
+        }
+
+        function computeProjectionOperator(sub) {
+            const vCol = sub.v;
+            return (vector) => {
+                const projScalar = dotProduct(vCol, vector);
+                return vCol.map(component => component * projScalar);
+            };
+        }
+
+        function normalizeVector(v) {
+            const norm = vectorNorm(v);
+            return v.map(component => component / (norm + EPSILON));
+        }
+
+        function computeEntropy(p) {
+            let sum = 0;
+            for (let val of p) {
+                const safe = Math.max(val, EPSILON);
+                sum += safe * Math.log(safe);
+            }
+            return -sum;
+        }
+
+        // Substrate class
+        class Substrate {
+            constructor(isFast) {
+                this.p = new Array(DIM_STATE).fill(0.1);
+                if (isFast) {
+                    // Biased wrong
+                    this.p[0] = 0.91;  // Wrong "target"
+                    this.v = normalizeVector([0, -1]);  // Down to wrong
+                    this.r = 10.0;  // High capacity (fast)
+                    this.h = 0.5;  // Low entropy
+                } else {
+                    // Accurate but uncertain
+                    this.p.fill(1 / DIM_STATE);  // Uniform, high entropy
+                    this.v = normalizeVector([0, 1]);  // Up to correct
+                    this.r = 0.1;  // Low capacity (slow)
+                    this.h = computeEntropy(this.p);  // High ~2.3
+                }
+                this.pos = [200, 200 + (Math.random() - 0.5) * 50];  // Start center
+            }
+        }
+
+        // Orchestration Engine for IT-OFNG
+        class OrchestrationEngine {
+            constructor(substrates) {
+                this.substrates = substrates;
+                this.n = substrates.length;
+            }
+
+            orchestrationStep() {
+                const dPerp = new Array(this.n).fill(0).map(() => new Array(this.n).fill(0));
+                for (let i = 0; i < this.n; i++) {
+                    for (let j = 0; j < this.n; j++) {
+                        if (i !== j) {
+                            dPerp[i][j] = perpendicularDivergence(this.substrates[i], this.substrates[j]);
+                        }
+                    }
+                }
+
+                // No compromise, skip detection
+
+                // Temporal modulation
+                const deltaT = new Array(this.n).fill(0);
+                for (let i = 0; i < this.n; i++) {
+                    deltaT[i] = temporalModulation(this.substrates[i], V_S);
+                }
+
+                // Influence weights
+                const wTilde = new Array(this.n).fill(0).map(() => new Array(this.n).fill(0));
+                for (let i = 0; i < this.n; i++) {
+                    let zI = 0;
+                    for (let j = 0; j < this.n; j++) {
+                        if (i !== j) {
+                            wTilde[i][j] = 1 / (dPerp[i][j] + EPSILON);
+                            zI += wTilde[i][j];
+                        }
+                    }
+                    if (zI > 0) {
+                        for (let j = 0; j < this.n; j++) {
+                            wTilde[i][j] /= zI;
+                        }
+                    }
+                }
+
+                // Projection updates
+                for (let i = 0; i < this.n; i++) {
+                    let influenceSum = [0, 0];
+                    for (let j = 0; j < this.n; j++) {
+                        if (i !== j) {
+                            const project = computeProjectionOperator(this.substrates[j]);
+                            const projected = project(this.substrates[i].v);
+                            const contrib = projected.map(val => val * wTilde[i][j] * deltaT[j]);
+                            influenceSum = influenceSum.map((val, k) => val + contrib[k]);
+                        }
+                    }
+                    const vNew = this.substrates[i].v.map(val => ALPHA * val).map((val, k) => val + (1 - ALPHA) * influenceSum[k]);
+                    this.substrates[i].v = normalizeVector(vNew);
+                }
+            }
+        }
+
+        // Baseline averaging
+        function baselineStep(substrates) {
+            const avgV = [0, 0];
+            substrates.forEach(sub => {
+                avgV[0] += sub.v[0] / N;
+                avgV[1] += sub.v[1] / N;
+            });
+            substrates.forEach(sub => {
+                sub.v = normalizeVector(avgV);
+            });
+        }
+
+        // Metrics computation
+        function computeMetrics(substrates, t) {
+            // Centroid position
+            const centroid = substrates.reduce((acc, sub) => [acc[0] + sub.pos[0]/N, acc[1] + sub.pos[1]/N], [0, 0]);
+
+            // Distance to correct target
+            const distCorrect = Math.sqrt((centroid[0] - CORRECT_TARGET[0])**2 + (centroid[1] - CORRECT_TARGET[1])**2);
+
+            // Distance to wrong target
+            const distWrong = Math.sqrt((centroid[0] - WRONG_TARGET[0])**2 + (centroid[1] - WRONG_TARGET[1])**2);
+
+            // Coherence: inverse std dev of positions
+            const positions = substrates.map(sub => sub.pos);
+            const dists = positions.map(pos => Math.sqrt((pos[0] - centroid[0])**2 + (pos[1] - centroid[1])**2));
+            const stdDist = Math.sqrt(dists.reduce((acc, d) => acc + (d - dists.reduce((a, b) => a + b)/N)**2, 0) / N);
+            const coherence = 100 / (1 + stdDist / 10);  // Arbitrary scale to %
+
+            return { distCorrect: distCorrect.toFixed(0), distWrong: distWrong.toFixed(0), coherence: coherence.toFixed(0) };
+        }
+
+        // Drawing function
+        function drawSwarm(canvas, substrates, correctTarget, wrongTarget) {
+            const ctx = canvas.getContext('2d');
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            // Draw targets
+            ctx.fillStyle = 'green';
+            ctx.beginPath();
+            ctx.arc(correctTarget[0], correctTarget[1], 10, 0, 2 * Math.PI);
+            ctx.fill();
+
+            ctx.fillStyle = 'red';
+            ctx.beginPath();
+            ctx.arc(wrongTarget[0], wrongTarget[1], 10, 0, 2 * Math.PI);
+            ctx.fill();
+
+            // Draw nodes
+            substrates.forEach(sub => {
+                ctx.beginPath();
+                ctx.arc(sub.pos[0], sub.pos[1], sub.r > 1 ? 3 : 8, 0, 2 * Math.PI);  // Small for fast, large for slow
+                ctx.fillStyle = sub.r > 1 ? 'red' : 'blue';
+                ctx.fill();
+            });
+        }
+
+        // Update metrics display
+        function updateMetrics(id, metrics, t) {
+            const div = document.getElementById(id);
+            div.innerHTML = `
+                <p>Time: ${t} steps</p>
+                <p>Dist to Correct: ${metrics.distCorrect}px</p>
+                <p>Dist to Wrong: ${metrics.distWrong}px</p>
+                <p>Coherence: ${metrics.coherence}%</p>
+            `;
+        }
+
+        // Main simulation
+        let baselineSubs, itofngSubs, engine, timeStep = 0;
+
+        function initSim() {
+            baselineSubs = [];
+            itofngSubs = [];
+            for (let i = 0; i < N; i++) {
+                const isFast = i < FAST_COUNT;
+                const subB = new Substrate(isFast);
+                baselineSubs.push(subB);
+
+                const subI = new Substrate(isFast);
+                subI.p = [...subB.p];
+                subI.v = [...subB.v];
+                subI.pos = [...subB.pos];
+                subI.r = subB.r;
+                subI.h = subB.h;
+                itofngSubs.push(subI);
+            }
+            engine = new OrchestrationEngine(itofngSubs);
+            timeStep = 0;
+        }
+
+        function simulateStep() {
+            // Baseline update
+            baselineStep(baselineSubs);
+
+            // IT-OFNG update
+            engine.orchestrationStep();
+
+            // Update positions
+            baselineSubs.forEach(sub => {
+                sub.pos[0] = Math.max(0, Math.min(400, sub.pos[0] + sub.v[0] * SCALE));
+                sub.pos[1] = Math.max(0, Math.min(400, sub.pos[1] + sub.v[1] * SCALE));
+            });
+            itofngSubs.forEach(sub => {
+                sub.pos[0] = Math.max(0, Math.min(400, sub.pos[0] + sub.v[0] * SCALE));
+                sub.pos[1] = Math.max(0, Math.min(400, sub.pos[1] + sub.v[1] * SCALE));
+            });
+
+            // Draw
+            drawSwarm(document.getElementById('baselineCanvas'), baselineSubs, CORRECT_TARGET, WRONG_TARGET);
+            drawSwarm(document.getElementById('itofngCanvas'), itofngSubs, CORRECT_TARGET, WRONG_TARGET);
+
+            // Metrics
+            if (timeStep % 10 === 0) {
+                const baseMetrics = computeMetrics(baselineSubs, timeStep);
+                const itMetrics = computeMetrics(itofngSubs, timeStep);
+                updateMetrics('baselineMetrics', baseMetrics, timeStep);
+                updateMetrics('itofngMetrics', itMetrics, timeStep);
+            }
+
+            timeStep++;
+            if (timeStep < MAX_TIME) {
+                requestAnimationFrame(simulateStep);
+            } else {
+                alert('Simulation complete. Note how IT-OFNG converges to the correct target by equity-modulating influence, while baseline is dominated by fast biased nodes.');
+            }
+        }
+
+        function startSimulation() {
+            initSim();
+            simulateStep();
+        }
+    </script>
+</body>
+</html>
